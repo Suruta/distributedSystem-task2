@@ -1,4 +1,2 @@
 .venv/
-counter_pb2.py
-counter_pb2_grpc.py
 .DS_Store
