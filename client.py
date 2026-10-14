@@ -1,4 +1,13 @@
+"""Counter client (Task A2).
+
+Failure handling:
+  * every RPC carries a deadline (default 2.0 s)
+  * on DEADLINE_EXCEEDED / UNAVAILABLE: at most 3 retries, backoff 0.2/0.4/0.8 s
+  * the idempotency key is generated ONCE per logical operation and reused on
+    every retry, so the server's dedup store can suppress double application
+"""
 import argparse
+import sys
 import time
 import uuid
 
@@ -7,172 +16,79 @@ import grpc
 import counter_pb2
 import counter_pb2_grpc
 
-
+DEFAULT_TARGET = "localhost:50051"
+TIMEOUT_S = 2.0
 MAX_RETRIES = 3
-DEADLINE_SECONDS = 2.0
-INITIAL_BACKOFF_SECONDS = 0.2
+BACKOFF_BASE_S = 0.2
+RETRYABLE = (grpc.StatusCode.DEADLINE_EXCEEDED, grpc.StatusCode.UNAVAILABLE)
 
 
-class CounterClient:
-    def __init__(
-        self,
-        address="localhost:50052",
-        client_name="client-1",
-    ):
-        self._name = client_name
+def _call_with_retries(rpc, request, timeout=TIMEOUT_S, max_retries=MAX_RETRIES,
+                       backoff_base=BACKOFF_BASE_S):
+    """Invoke rpc(request); retry retryable failures with exponential backoff.
 
-        # Lamport clock for this client process.
-        self._lamport = 0
+    The SAME request object (hence the same idempotency key) is sent each time.
+    """
+    attempt = 0
+    while True:
+        try:
+            return rpc(request, timeout=timeout)
+        except grpc.RpcError as err:
+            if err.code() not in RETRYABLE or attempt >= max_retries:
+                raise
+            delay = backoff_base * (2 ** attempt)  # 0.2, 0.4, 0.8
+            attempt += 1
+            print(f"[retry {attempt}/{max_retries}] {err.code().name}; "
+                  f"sleeping {delay:.1f}s", file=sys.stderr)
+            time.sleep(delay)
 
-        self.channel = grpc.insecure_channel(address)
-        self.stub = counter_pb2_grpc.CounterStub(self.channel)
 
-    def _local_event(self):
-        """Advance the Lamport clock for a local event."""
-        self._lamport += 1
-        return self._lamport
+def increment(stub, counter_id, delta, key=None, **kwargs):
+    """One logical increment. A key is created once here unless supplied."""
+    key = key or str(uuid.uuid4())
+    request = counter_pb2.IncrementRequest(
+        counter_id=counter_id, delta=delta, idempotency_key=key)
+    return _call_with_retries(stub.Increment, request, **kwargs)
 
-    def _receive_event(self, received_lamport):
-        """Update Lamport clock when receiving a message."""
-        self._lamport = max(
-            self._lamport,
-            received_lamport,
-        ) + 1
 
-        return self._lamport
-
-    def increment(self, counter_id, delta):
-        # Generate the idempotency key ONCE for this
-        # logical operation.
-        idempotency_key = str(uuid.uuid4())
-
-        for attempt in range(MAX_RETRIES + 1):
-
-            # Sending the request is a local event.
-            send_lamport = self._local_event()
-
-            request = counter_pb2.IncrementRequest(
-                counter_id=counter_id,
-                delta=delta,
-                idempotency_key=idempotency_key,
-                lamport_time=send_lamport,
-            )
-
-            print(
-                f"[{self._name}] SEND "
-                f"Increment(counter={counter_id}, "
-                f"delta={delta}) "
-                f"L={send_lamport}"
-            )
-
-            try:
-                response = self.stub.Increment(
-                    request,
-                    timeout=DEADLINE_SECONDS,
-                )
-
-                # Receiving the reply is an event.
-                recv_lamport = self._receive_event(
-                    response.lamport_time
-                )
-
-                print(
-                    f"[{self._name}] RECV "
-                    f"IncrementReply(new_value="
-                    f"{response.new_value}) "
-                    f"L={recv_lamport} "
-                    f"(received L={response.lamport_time})"
-                )
-
-                return response
-
-            except grpc.RpcError as e:
-                if e.code() not in (
-                    grpc.StatusCode.DEADLINE_EXCEEDED,
-                    grpc.StatusCode.UNAVAILABLE,
-                ):
-                    raise
-
-                if attempt == MAX_RETRIES:
-                    raise
-
-                backoff = (
-                    INITIAL_BACKOFF_SECONDS
-                    * (2 ** attempt)
-                )
-
-                time.sleep(backoff)
-
-        raise RuntimeError(
-            "Increment failed unexpectedly"
-        )
-
-    def get(self, counter_id):
-        request = counter_pb2.GetRequest(
-            counter_id=counter_id,
-        )
-
-        response = self.stub.Get(
-            request,
-            timeout=DEADLINE_SECONDS,
-        )
-
-        return response
+def get(stub, counter_id, **kwargs):
+    request = counter_pb2.GetRequest(counter_id=counter_id)
+    return _call_with_retries(stub.Get, request, **kwargs)
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Distributed counter client"
-    )
+    parser = argparse.ArgumentParser(description="Counter client")
+    parser.add_argument("--target", default=DEFAULT_TARGET,
+                        help="server address (default: %(default)s)")
+    sub = parser.add_subparsers(dest="command", required=True)
 
-    subparsers = parser.add_subparsers(
-        dest="command",
-        required=True,
-    )
+    p_incr = sub.add_parser("incr", help="increment a counter")
+    p_incr.add_argument("counter_id")
+    p_incr.add_argument("--by", type=int, default=1)
+    p_incr.add_argument("--key", default=None,
+                        help="idempotency key (default: fresh uuid4)")
 
-    incr_parser = subparsers.add_parser(
-        "incr",
-        help="increment a counter",
-    )
-
-    incr_parser.add_argument(
-        "counter_id",
-    )
-
-    incr_parser.add_argument(
-        "--by",
-        type=int,
-        required=True,
-    )
-
-    get_parser = subparsers.add_parser(
-        "get",
-        help="get a counter value",
-    )
-
-    get_parser.add_argument(
-        "counter_id",
-    )
+    p_get = sub.add_parser("get", help="read a counter")
+    p_get.add_argument("counter_id")
 
     args = parser.parse_args()
 
-    client = CounterClient()
-
-    if args.command == "incr":
-        response = client.increment(
-            counter_id=args.counter_id,
-            delta=args.by,
-        )
-
-        print(
-            f"value={response.new_value} "
-            f"was_duplicate={response.was_duplicate}"
-        )
-
-    elif args.command == "get":
-        response = client.get(args.counter_id)
-
-        print(f"value={response.value}")
+    with grpc.insecure_channel(args.target) as channel:
+        stub = counter_pb2_grpc.CounterStub(channel)
+        try:
+            if args.command == "incr":
+                reply = increment(stub, args.counter_id, args.by, key=args.key)
+                dup = "yes" if reply.was_duplicate else "no"
+                print(f"OK committed value={reply.new_value} (duplicate: {dup})")
+            else:
+                reply = get(stub, args.counter_id)
+                if reply.found:
+                    print(f"value={reply.value}")
+                else:
+                    print(f"counter '{args.counter_id}' not found")
+        except grpc.RpcError as err:
+            print(f"FAILED: {err.code().name}: {err.details()}", file=sys.stderr)
+            sys.exit(1)
 
 
 if __name__ == "__main__":
