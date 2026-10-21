@@ -57,3 +57,15 @@ python3 client.py --target localhost:50052 incr likes:post-42 --by 1 --key my-ke
 python3 client.py --target localhost:50052 incr likes:post-42 --by 1 --key my-key-1
 python3 client.py --target localhost:50052 get likes:post-42
 ```
+
+## pytest
+
+```cmd
+python3 -m pytest -v
+```
+```cmd
+python3 -m pytest -v test_failure_injection.py
+```
+```cmd
+python3 perf_benchmark.py
+```

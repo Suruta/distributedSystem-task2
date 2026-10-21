@@ -10,6 +10,7 @@ always counter-lock -> clock-lock, never the reverse, so there is no deadlock.
 """
 import argparse
 import threading
+import time
 from concurrent import futures
 
 import grpc
@@ -20,17 +21,33 @@ from lamport import LamportClock
 
 
 class CounterServicer(counter_pb2_grpc.CounterServicer):
-    def __init__(self, name="replica-A", clock=None):
+    def __init__(self, name="replica-A", clock=None, delay_ms=0, delay_count=0):
         self._lock = threading.Lock()
         self._values = {}  # counter_id -> int
         self._seen = {}    # idempotency_key -> (counter_id, resulting value)
         self.clock = clock or LamportClock(name)
+        # Fault injection (Task C3): delay Increment handling by delay_ms.
+        # delay_count = how many requests to delay (0 = every request).
+        self._fault_delay_s = delay_ms / 1000.0
+        self._fault_delay_left = delay_count if delay_count > 0 else None
+        self._fault_lock = threading.Lock()
+
+    def _maybe_delay(self):
+        if self._fault_delay_s <= 0:
+            return
+        with self._fault_lock:
+            if self._fault_delay_left is not None:
+                if self._fault_delay_left == 0:
+                    return
+                self._fault_delay_left -= 1
+        time.sleep(self._fault_delay_s)  # NOT under the counter lock
 
     def Increment(self, request, context):
         cid, delta = request.counter_id, request.delta
         self.clock.receive(
             request.lamport_time,
             f"RECV Increment(counter={cid}, delta={delta})")
+        self._maybe_delay()
 
         key = request.idempotency_key
         if not key:
@@ -70,12 +87,14 @@ class CounterServicer(counter_pb2_grpc.CounterServicer):
                                     lamport_time=send_l)
 
 
-def build_server(port, max_workers=8, name="replica-A", clock=None):
+def build_server(port, max_workers=8, name="replica-A", clock=None,
+                 delay_ms=0, delay_count=0):
     """Create (but do not start) a server. port=0 picks a free port.
 
     Returns (server, bound_port, servicer) so tests can reuse it.
     """
-    servicer = CounterServicer(name=name, clock=clock)
+    servicer = CounterServicer(name=name, clock=clock,
+                               delay_ms=delay_ms, delay_count=delay_count)
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=max_workers))
     counter_pb2_grpc.add_CounterServicer_to_server(servicer, server)
     bound_port = server.add_insecure_port(f"[::]:{port}")
@@ -87,9 +106,16 @@ def main():
     parser.add_argument("--port", type=int, default=50051)
     parser.add_argument("--name", default="replica-A",
                         help="process name used in Lamport log lines")
+    parser.add_argument("--delay-ms", type=int, default=0,
+                        help="fault injection: delay Increment handling (ms)")
+    parser.add_argument("--delay-count", type=int, default=0,
+                        help="with --delay-ms: delay only the first N "
+                             "Increment requests (0 = all)")
     args = parser.parse_args()
 
-    server, port, _ = build_server(args.port, name=args.name)
+    server, port, _ = build_server(args.port, name=args.name,
+                                   delay_ms=args.delay_ms,
+                                   delay_count=args.delay_count)
     server.start()
     print(f"Counter server '{args.name}' listening on port {port}", flush=True)
     try:
